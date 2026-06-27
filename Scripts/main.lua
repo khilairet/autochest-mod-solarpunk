@@ -7,6 +7,14 @@ local DEBUG_ENABLED = false
 
 local INVENTORY_SYSTEM_CLASS = "BC_InventorySystem_C"
 
+-- Maximum distance from the player within which chests are searched for
+-- crafting materials, in Unreal units (≈ centimetres; 100 = 1 metre). Set to 0
+-- to search every chest on the map regardless of distance (original behaviour).
+-- Example: 5000 ≈ a 50 m radius around the player. Limiting the radius is the
+-- biggest win when a base has many far-flung chests, since out-of-range chests
+-- are never scanned.
+local CHEST_SCAN_RADIUS = 0
+
 local CONTAINS_ITEMS_AMT =
     "/Game/Code/Inventory_Items/Framework_and_Data/BC_InventorySystem.BC_InventorySystem_C:ContainsItemsAmt"
 
@@ -53,6 +61,11 @@ local QTY_FIELDS = {
     "Quantity_5_A1813C42482CE5E7961C589A983BD034",
     "Amount",
     "Amount_5_12AB5DA84DB6E8C535AD7D82D7F29009",
+}
+
+local MAX_STACK_FIELDS = {
+    "MaxStackSize",
+    "MaxStackSize_5_38058E5746B557DCB034A6B0A98794B6",
 }
 
 local function log(message)
@@ -109,9 +122,29 @@ local function set_param(param, value)
     end
 end
 
+-- Which candidate name actually resolved for each field group, keyed by the
+-- fields table itself (ITEM_FIELDS / QTY_FIELDS / MAX_STACK_FIELDS are stable
+-- table identities). On this build the same struct field always wins, so after
+-- the first probe we read it directly and skip the 3-4 failing pcalls per slot.
+-- The full probe still runs as a fallback if the remembered name ever misses,
+-- so correctness never depends on the cache being right.
+local resolved_field_cache = {}
+
 local function try_get(obj, fields)
     if obj == nil then
         return nil
+    end
+
+    local remembered = resolved_field_cache[fields]
+
+    if remembered ~= nil then
+        local ok, value = pcall(function()
+            return obj[remembered]
+        end)
+
+        if ok and value ~= nil then
+            return value
+        end
     end
 
     for _, field in ipairs(fields) do
@@ -120,6 +153,7 @@ local function try_get(obj, fields)
         end)
 
         if ok and value ~= nil then
+            resolved_field_cache[fields] = field
             return value
         end
     end
@@ -252,10 +286,19 @@ local function build_inventory_totals_map(inventory_system)
 
     slots:ForEach(function(_, elem)
         local slot = get_param(elem)
-        local slot_item = get_slot_item(slot)
+
+        -- Read quantity first: an empty slot reports 0 here, letting us skip it
+        -- without probing its Item fields or calling GetFullName on it. Empty
+        -- slots are usually the bulk of a chest, so this avoids the most work.
         local slot_qty = get_slot_qty(slot)
 
-        if slot_item ~= nil and slot_qty > 0 then
+        if slot_qty <= 0 then
+            return
+        end
+
+        local slot_item = get_slot_item(slot)
+
+        if slot_item ~= nil then
             local key = full_name_of(slot_item)
 
             if key ~= nil then
@@ -293,12 +336,16 @@ local function get_inventory_totals_map(inventory_system)
     return totals
 end
 
-local function count_item_in_inventory(inventory_system, item_class)
-    if item_class == nil then
-        return 0
-    end
+local function count_item_in_inventory(inventory_system, item_class, item_key)
+    -- item_key is optional; pass it in to avoid a redundant GetFullName call
+    -- when the caller already resolved the item class name.
+    if item_key == nil then
+        if item_class == nil then
+            return 0
+        end
 
-    local item_key = full_name_of(item_class)
+        item_key = full_name_of(item_class)
+    end
 
     if item_key == nil then
         return 0
@@ -343,6 +390,92 @@ local function get_all_chest_inventories(player_inventory)
     end
 
     return result
+end
+
+-- World location of an inventory's owning actor (the chest actor, or the player
+-- character), or nil if it can't be resolved. Callers treat nil as "in range"
+-- (fail-open) so a position we can't read never hides a chest's stock.
+local function actor_location_of(inventory_system)
+    local owner = get_outer(inventory_system)
+
+    if not is_valid(owner) or owner.K2_GetActorLocation == nil then
+        return nil
+    end
+
+    local ok, loc = pcall(function()
+        return owner:K2_GetActorLocation()
+    end)
+
+    if not ok or loc == nil then
+        return nil
+    end
+
+    local x = tonumber(get_param(loc.X))
+    local y = tonumber(get_param(loc.Y))
+    local z = tonumber(get_param(loc.Z))
+
+    if x == nil or y == nil or z == nil then
+        return nil
+    end
+
+    return x, y, z
+end
+
+-- The full chest list (cached above) filtered to those within CHEST_SCAN_RADIUS
+-- of the player. When the radius is disabled (0) this is a no-op that returns
+-- the full list with zero extra work. The filtered result is cached very
+-- briefly so a multi-ingredient craft doesn't recompute distances per item;
+-- the player barely moves during a craft, so a short TTL is accurate enough.
+local relevant_chests_cache = nil
+local relevant_chests_cache_time = nil
+local RELEVANT_CHESTS_TTL_SECONDS = 0.25
+
+local function get_relevant_chest_inventories(player_inventory)
+    local all_chests = get_all_chest_inventories(player_inventory)
+
+    if CHEST_SCAN_RADIUS <= 0 then
+        return all_chests
+    end
+
+    local now = now_seconds()
+
+    if now ~= nil and relevant_chests_cache ~= nil
+        and (now - relevant_chests_cache_time) < RELEVANT_CHESTS_TTL_SECONDS then
+        return relevant_chests_cache
+    end
+
+    local px, py, pz = actor_location_of(player_inventory)
+
+    -- Can't locate the player: don't filter, fall back to every chest.
+    if px == nil then
+        return all_chests
+    end
+
+    local radius_sq = CHEST_SCAN_RADIUS * CHEST_SCAN_RADIUS
+    local in_range = {}
+
+    for _, chest in ipairs(all_chests) do
+        local cx, cy, cz = actor_location_of(chest)
+
+        if cx == nil then
+            table.insert(in_range, chest)
+        else
+            local dx = cx - px
+            local dy = cy - py
+            local dz = cz - pz
+
+            if (dx * dx + dy * dy + dz * dz) <= radius_sq then
+                table.insert(in_range, chest)
+            end
+        end
+    end
+
+    if now ~= nil then
+        relevant_chests_cache = in_range
+        relevant_chests_cache_time = now
+    end
+
+    return in_range
 end
 
 -- HasEnoughParts? is called on a UI widget (self = the widget, not an
@@ -429,7 +562,12 @@ local function material_ui_active()
 end
 
 local function get_total_amount_with_chests(player_inventory, item_class)
-    local cache_key = full_name_of(item_class) or tostring(item_class)
+    -- Resolve the item name once and reuse it for the cache key and every
+    -- per-inventory lookup below, instead of calling GetFullName ~once per
+    -- chest. This runs per ingredient per recipe tile per UI refresh, so it
+    -- is the hottest path in the mod.
+    local item_key = full_name_of(item_class)
+    local cache_key = item_key or tostring(item_class)
     local now = now_seconds()
 
     if cache_key ~= nil and now ~= nil then
@@ -443,10 +581,10 @@ local function get_total_amount_with_chests(player_inventory, item_class)
     chest_lookup_in_progress = true
 
     local ok, total = pcall(function()
-        local sum = count_item_in_inventory(player_inventory, item_class)
+        local sum = count_item_in_inventory(player_inventory, item_class, item_key)
 
-        for _, chest_inventory in ipairs(get_all_chest_inventories(player_inventory)) do
-            sum = sum + count_item_in_inventory(chest_inventory, item_class)
+        for _, chest_inventory in ipairs(get_relevant_chest_inventories(player_inventory)) do
+            sum = sum + count_item_in_inventory(chest_inventory, item_class, item_key)
         end
 
         return sum
@@ -461,6 +599,49 @@ local function get_total_amount_with_chests(player_inventory, item_class)
     end
 
     return result
+end
+
+-- Like get_total_amount_with_chests, but answers only "is there at least
+-- `needed`?" so it can stop as soon as the answer is known: if the player's own
+-- inventory already covers it, NO chest is scanned at all (the common case), and
+-- otherwise chests are added one at a time until the threshold is reached. Used
+-- by the craft/affordability decisions, which only need the boolean. The
+-- displayed combined totals still use get_total_amount_with_chests because they
+-- need the exact sum, not just "enough or not".
+local function has_enough_with_chests(player_inventory, item_class, needed, item_key)
+    if needed <= 0 then
+        return true
+    end
+
+    item_key = item_key or full_name_of(item_class)
+
+    if item_key == nil then
+        return false
+    end
+
+    chest_lookup_in_progress = true
+
+    local ok, enough = pcall(function()
+        local sum = count_item_in_inventory(player_inventory, item_class, item_key)
+
+        if sum >= needed then
+            return true
+        end
+
+        for _, chest_inventory in ipairs(get_relevant_chest_inventories(player_inventory)) do
+            sum = sum + count_item_in_inventory(chest_inventory, item_class, item_key)
+
+            if sum >= needed then
+                return true
+            end
+        end
+
+        return false
+    end)
+
+    chest_lookup_in_progress = false
+
+    return ok and enough
 end
 
 -- Decrements chest slot quantities directly (clearing the slot if it hits
@@ -513,7 +694,9 @@ local function decrement_from_inventory(inventory_system, item_class, amount)
 
             if set_ok then
                 removed = removed + take
-                log_debug("removed " .. tostring(take) .. " of " .. tostring(full_name_of(item_class)) .. " from a slot (new_qty=" .. tostring(new_qty) .. ").")
+                if DEBUG_ENABLED then
+                    log_debug("removed " .. tostring(take) .. " of " .. tostring(full_name_of(item_class)) .. " from a slot (new_qty=" .. tostring(new_qty) .. ").")
+                end
             else
                 log_debug("failed to write decremented quantity onto a slot.")
             end
@@ -523,13 +706,116 @@ local function decrement_from_inventory(inventory_system, item_class, amount)
     return removed
 end
 
+local function get_slot_max_stack(slot)
+    local value = tonumber(try_get(slot, MAX_STACK_FIELDS))
+
+    if value == nil or value <= 0 then
+        return 999
+    end
+
+    return value
+end
+
+-- Puts `amount` of item_class back into an inventory after a failed craft, to
+-- undo what the native RemoveMultipleItems consumed. Tops up existing same-item
+-- stacks first, then writes item_class directly into empty slots. template_slot
+-- (the recipe slot) is only read, never mutated, to discover the right field
+-- names for an inventory whose same-item slots were all emptied. Returns the
+-- amount it could not place.
+local function add_to_inventory(inventory_system, item_class, amount, template_slot)
+    local remaining = amount
+    local slots = get_inventory_array(inventory_system)
+
+    if slots == nil then
+        return remaining
+    end
+
+    -- Field names for placing into an EMPTY slot can't be read off the empty
+    -- slot itself (its Item is nil), so fall back to the recipe slot's names.
+    -- (Pass 1 resolves the qty field off each occupied slot directly, matching
+    -- decrement_from_inventory's proven approach.)
+    local fallback_item_field = find_field_name(template_slot, ITEM_FIELDS)
+    local default_max_stack = get_slot_max_stack(template_slot)
+
+    -- Pass 1: top up existing stacks of the same item.
+    slots:ForEach(function(_, elem)
+        if remaining <= 0 then
+            return
+        end
+
+        local slot = get_param(elem)
+        local slot_item = get_slot_item(slot)
+        local slot_qty = get_slot_qty(slot)
+
+        if slot_item == nil or slot_qty <= 0 or not same_item(slot_item, item_class) then
+            return
+        end
+
+        local space = get_slot_max_stack(slot) - slot_qty
+
+        if space <= 0 then
+            return
+        end
+
+        local qty_field = find_field_name(slot, QTY_FIELDS)
+
+        if qty_field == nil then
+            return
+        end
+
+        local add = math.min(space, remaining)
+        slot[qty_field] = slot_qty + add
+
+        if pcall(function() elem:set(slot) end) then
+            remaining = remaining - add
+        end
+    end)
+
+    -- Pass 2: place leftovers into empty slots by writing item_class onto the
+    -- empty slot's own struct. The empty slot still exposes its Quantity field
+    -- (value 0, so find_field_name resolves it), but not its Item field, so we
+    -- use the recipe slot's item field name for that one.
+    if remaining > 0 and fallback_item_field ~= nil then
+        slots:ForEach(function(_, elem)
+            if remaining <= 0 then
+                return
+            end
+
+            local slot = get_param(elem)
+            local slot_item = get_slot_item(slot)
+            local slot_qty = get_slot_qty(slot)
+
+            if slot_item ~= nil and slot_qty > 0 then
+                return
+            end
+
+            local qty_field = find_field_name(slot, QTY_FIELDS)
+
+            if qty_field == nil then
+                return
+            end
+
+            local place = math.min(default_max_stack, remaining)
+
+            slot[fallback_item_field] = item_class
+            slot[qty_field] = place
+
+            if pcall(function() elem:set(slot) end) then
+                remaining = remaining - place
+            end
+        end)
+    end
+
+    return remaining
+end
+
 -- Removes `amount` of item_class, taking from the player's own inventory first
 -- (this covers items the native craft removal left behind, e.g. hotbar slots
 -- it does not consume) and then from chests. Returns true if fully removed.
 local function remove_amount(player_inventory, item_class, amount)
     local remaining = amount - decrement_from_inventory(player_inventory, item_class, amount)
 
-    for _, chest_inventory in ipairs(get_all_chest_inventories(player_inventory)) do
+    for _, chest_inventory in ipairs(get_relevant_chest_inventories(player_inventory)) do
         if remaining <= 0 then
             break
         end
@@ -557,8 +843,18 @@ local function on_remove_multiple_items_post(context, items_param, save_param, i
         return nil
     end
 
-    -- The native removal just mutated the real inventory; drop cached counts so
-    -- we read the true post-removal numbers below.
+    -- This hook fires ONLY on a real craft (a click), never on the passive UI
+    -- refresh, so the per-frame UI path keeps using the cached counts and stays
+    -- fast. Here, at craft time, we deliberately drop ALL cached counts and
+    -- recompute the affordability decision (all_ok below) from the true, CURRENT
+    -- contents of the player inventory AND every chest. This is the "check
+    -- before, never roll back after" guarantee: we only ever decrement a chest
+    -- once this live recount has confirmed the whole recipe is covered, so we
+    -- never have to put anything back into a chest. In multiplayer it is also
+    -- what keeps the decision correct when another player has just emptied a
+    -- chest a moment ago (a stale cached total could otherwise allow a craft
+    -- whose ingredients are already gone). The one fresh chest rescan this costs
+    -- is the small craft-time hitch; it does not affect UI smoothness.
     inventory_totals_cache = {}
     total_cache = {}
 
@@ -567,6 +863,7 @@ local function on_remove_multiple_items_post(context, items_param, save_param, i
     -- remove partially, or a non-craftable recipe would eat ingredients for no
     -- output.
     local removals = {}
+    local restorations = {}
     local any_work = false
     local all_ok = true
 
@@ -579,6 +876,15 @@ local function on_remove_multiple_items_post(context, items_param, save_param, i
             local key = full_name_of(item_class)
             local pre = key ~= nil and pre_craft_counts[key] or nil
             local now_player = count_item_in_inventory(player_inventory, item_class)
+
+            -- Track what the native pass already took from the player so we can
+            -- give it back if the recipe turns out to be uncraftable.
+            if pre ~= nil then
+                local native_removed = pre - now_player
+                if native_removed > 0 then
+                    table.insert(restorations, { item_class = item_class, amount = native_removed, template = slot })
+                end
+            end
 
             local still_needed
             if pre ~= nil then
@@ -596,12 +902,12 @@ local function on_remove_multiple_items_post(context, items_param, save_param, i
             if still_needed > 0 then
                 any_work = true
 
-                local total_available = get_total_amount_with_chests(player_inventory, item_class)
-
-                if total_available < still_needed then
-                    all_ok = false
-                else
+                -- Early-break check: stops as soon as enough is found (and never
+                -- touches chests if the player alone already covers `still_needed`).
+                if has_enough_with_chests(player_inventory, item_class, still_needed, key) then
                     table.insert(removals, { item_class = item_class, amount = still_needed })
+                else
+                    all_ok = false
                 end
             end
         end
@@ -612,9 +918,19 @@ local function on_remove_multiple_items_post(context, items_param, save_param, i
         return nil
     end
 
-    -- Can't fully satisfy the recipe: don't remove anything, let the craft fail.
+    -- Can't fully satisfy the recipe: undo what native already took from the
+    -- player so a failed craft never eats components, force failure so no
+    -- output item is produced, and let the craft abort.
     if not all_ok then
-        return nil
+        for _, entry in ipairs(restorations) do
+            add_to_inventory(player_inventory, entry.item_class, entry.amount, entry.template)
+        end
+
+        inventory_totals_cache = {}
+        total_cache = {}
+
+        set_param(success_param, false)
+        return false
     end
 
     for _, entry in ipairs(removals) do
@@ -652,14 +968,16 @@ local function on_contains_items_amt_post(context, items_param, contains_param)
             -- native actually consumed.
             local key = full_name_of(item_class)
             if key ~= nil then
-                pre_craft_counts[key] = count_item_in_inventory(player_inventory, item_class)
+                pre_craft_counts[key] = count_item_in_inventory(player_inventory, item_class, key)
             end
 
-            local total = get_total_amount_with_chests(player_inventory, item_class)
+            local enough = has_enough_with_chests(player_inventory, item_class, qty_needed, key)
 
-            log_debug("ContainsItemsAmt item=" .. tostring(full_name_of(item_class)) .. " needed=" .. tostring(qty_needed) .. " total=" .. tostring(total))
+            if DEBUG_ENABLED then
+                log_debug("ContainsItemsAmt item=" .. tostring(key) .. " needed=" .. tostring(qty_needed) .. " enough=" .. tostring(enough))
+            end
 
-            if total < qty_needed then
+            if not enough then
                 all_satisfied = false
             end
         end
@@ -688,9 +1006,7 @@ local function on_contains_item_amt_post(context, slot_param, contains_param)
         return nil
     end
 
-    local total = get_total_amount_with_chests(player_inventory, item_class)
-
-    if total >= qty_needed then
+    if has_enough_with_chests(player_inventory, item_class, qty_needed) then
         set_param(contains_param, true)
         return true
     end
@@ -723,9 +1039,7 @@ local function on_has_enough_parts_post(context, return_param)
         return nil
     end
 
-    local total = get_total_amount_with_chests(player_inventory, item_class)
-
-    if total >= qty_needed then
+    if has_enough_with_chests(player_inventory, item_class, qty_needed) then
         set_param(return_param, true)
         return true
     end
