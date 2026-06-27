@@ -1,0 +1,16 @@
+# AutoChest configuration
+# Edit the values below, then restart the game (or reload UE4SS Lua mods).
+# Lines starting with # are ignored. Format: key=number
+
+# How far (in Unreal units; 100 = 1 metre) crafting looks for chest materials.
+# 0 = search every chest on the map, regardless of distance.
+scan_radius=0
+
+# How far the quick-deposit hotkey looks for chests to drop items into. Unlike
+# scan_radius, 0 is NOT "whole map" here; keep a real distance. 2200 is roughly
+# the in-game "nearby" range.
+deposit_radius=2200
+
+# Key that triggers quick-deposit. Use a UE4SS Key enum name, e.g. F1..F12, a
+# letter (G), or numpad (NUM_ONE). Default F2.
+deposit_key=F2

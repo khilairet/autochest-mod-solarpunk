@@ -1,63 +1,81 @@
 # Solarpunk UE4SS mods — context for Claude
 
-This folder hosts two UE4SS Lua mods for the game **Solarpunk** (Unreal Engine 5, modded via UE4SS):
+This folder hosts the **AutoChest** UE4SS Lua mod for the game **Solarpunk** (Unreal Engine 5, modded via UE4SS).
 
-1. **`Scripts/` + `enabled.txt` at the root** — `SolarpunkBetterQuickStack`, an existing/older mod (chest quick-stack helpers). Treat its `Scripts/main.lua` as a reference implementation for UE4SS Lua patterns (hook registration, struct field access, etc.) — it is NOT the mod currently being worked on.
-2. **`AutoChest/`** — the mod currently under active development (this is the one we're building/debugging). Also installed live at:
-   `D:\SteamLibrary\steamapps\common\Solarpunk\Solarpunk\Binaries\Win64\ue4ss\Mods\AutoChest\`
-   **Both copies must be kept in sync manually** (there is no symlink — copy the file both ways after edits).
+Reference implementations also installed on this machine (treat as read-only examples of UE4SS Lua patterns — hook registration, struct field access, item moves, keybinds):
+- **`ue4ss-essential/Mods/EnhancedChests/`** — internal name `SolarpunkBetterQuickStack`. Implements quick-stack to nearby chests via the native `MoveItemAmtToDiffInv`; the source of AutoChest's quick-deposit item-move pattern.
+- **`ue4ss-essential/Mods/VanguardFramework/`** — multi-file mod; source of the `require("module")(ctx)` factory pattern and `RegisterKeyBind(Key.X, {ModifierKey.Y}, fn)` usage.
 
 ## Goal of AutoChest
 
-When the player opens a workbench/crafting UI, the displayed ingredient quantities and the "Craft" button's enabled state should account for items in **all chests on the map**, not just the player's personal inventory. When the player actually clicks "Craft", missing ingredients should be pulled from chests **at that exact moment**, immediately consumed by the same action.
+When the player opens a workbench/crafting UI or build mode, displayed ingredient quantities and the "Craft" button's enabled state account for items in **chests** (within an optional radius), not just the player's inventory. Clicking "Craft" pulls missing ingredients from chests **at that exact moment**, consumed by the same action. A hotkey also quick-deposits inventory items into nearby chests that already hold them.
 
 ### Explicit design decision ("Option B")
 
-The user explicitly rejected pre-loading/borrowing chest items into the player's bag while a workbench window is open (risk: leftover items in player inventory after closing the window, especially bad in multiplayer). Chosen approach instead: pull the missing amount from chests **only** inside the native craft function, in the same call that consumes it. Zero pre-display top-up, zero leftover risk. The user explicitly accepted that this means the displayed quantity prior to having items pulled may not perfectly preview combined totals — mitigated by also hooking the affordability check (below) so the UI's "craftable" state still reflects combined player+chest totals even though no items have physically moved yet.
+The user rejected pre-loading/borrowing chest items into the player's bag while a workbench is open (risk: leftovers after closing, bad in multiplayer). Instead, missing amounts are pulled from chests **only** inside the native craft consumption, in the same call that consumes them. Zero pre-display top-up, zero leftover risk. The "craftable" UI state is kept correct by also hooking the affordability check, even though no items have physically moved yet.
 
-## Key native functions discovered (via UE4SS EventViewer trace of clicking "Craft")
+## Status: working
 
-All on `BC_InventorySystem_C`, full path prefix `/Game/Code/Inventory_Items/Framework_and_Data/BC_InventorySystem.BC_InventorySystem_C:`
+Crafting-from-chests, build-mode counts, and the F2 quick-deposit are all confirmed working in-game (incl. a mixed host/client multiplayer setup, where each client runs the mod).
 
-- **`CraftItemSlot(CraftingRecipy: S_SingleCraftingRecipy, CraftingPlayerController: PlayerController)`** — the master craft function, called directly from the Craft button's click chain. Internally calls `ContainsItemsAmt` (afford check) → `RemoveMultipleItems` (consumption) → `AddItemForPlayer` (gives output) → `Replace Inventory`/`OnRep_Inventory` (replication, fires UI refresh) → `SaveInventory`.
-  - `S_SingleCraftingRecipy` struct fields (confirmed via Live View dump): `Endproduct_6_A149C932493B1524BFE79E81F4E544C5` (array of `S_InventorySlotSlim`) and `CraftingParts_5_3D0AF1AA4E64FE01DBBCCB8204A9DA6C` (array of `S_InventorySlotSlim`, the actual ingredients needed).
-  - `S_InventorySlotSlim` fields: `Item_4_B9922CA845A5618A776EAFAB1A690E93` (ClassProperty — item class), `Quantity_5_A1813C42482CE5E7961C589A983BD034` (Int), `AdditionalSavedata_12_7C875E564155FCA4AA2B4597ACB03361` (Str).
-- **`ContainsItemsAmt(Items: Array<S_InventorySlotSlim>) -> Contains: Bool`** — checks whether `self` (an inventory system instance) contains enough of every listed item. Used BOTH by `CraftItemSlot`'s internal check AND by the UI's `SW_PreFilledGrid_*.UpdateCraftingTiles` → `SW_CraftingTile_C.SetIsCraftable` refresh cycle (i.e., this single function drives both the "can afford" gate at craft-time and the tile's craftable-looking display/button-enabled state).
-- **`ContainsItemAmt(Item, GivenItem) -> Contains: Bool`** — per-item version, called in a loop by `ContainsItemsAmt`.
-- Also available on `BC_InventorySystem_C` (seen in the full function list dump): `GetAmtOfItem`, `MoveItemAmtToDiffInv`, `GetFirstNotFullSlotForItem`, `GetFirstIndexWithFreeSlot`, `RemoveMultipleItems`, `AddItemForPlayer`, `Inventory` (the slot array property), `SaveInventory`, `Quick Stack`.
-- Player's own inventory component is a property literally named `InventorySystem` on `BP_MainPlayerCharacter_C` (confirmed via the bound-event name `BndEvt__BP_MainPlayerCharacter_InventorySystem_K2Node_...`).
-- Chest ownership check: an inventory system instance's `GetOuter()` full name contains `"Chest"` when it belongs to a chest actor (pattern reused from the older quick-stack mod).
+## Architecture (`Scripts/`, multi-file)
 
-## Current mod implementation (`AutoChest/Scripts/main.lua`)
+`main.lua` is the entry point. It builds a shared `ctx` table and requires each module as a factory — `ctx.x = require("x")(ctx)` — in dependency order, so each module captures the ones it needs. Each module owns its own mutable state (caches); other modules mutate it only through exposed functions.
 
-Two hooks on `BC_InventorySystem_C`:
+| File | Responsibility |
+|---|---|
+| `config.lua` | Constants (UFunction paths, struct field-name candidates, radii, key) + `load_file()` reading `config.txt`. Returns one table; `scan_radius`/`deposit_radius`/`deposit_key` are read dynamically so an edited file takes effect. |
+| `util.lua` | Stateless helpers: logging, `now_seconds`, `is_valid`, `get_param`/`set_param`, `try_get` (with a resolved-field-name cache), `find_field_name`, `full_name_of`, `get_outer`, `same_item`, slot accessors, `get_inventory_array`. |
+| `inventory.lua` | Chest & player resolution (`FindAllOf` + outer-name filter, both cached ~10 s), `actor_location_of` + `filter_chests_within_radius`, per-inventory content maps (cached 0.5 s), combined `get_total_amount_with_chests` (exact, for display) and `has_enough_with_chests` (early-break boolean, for decisions). Owns all read caches + `chest_lookup_in_progress`. |
+| `mutate.lua` | The only writers: `decrement_from_inventory`, `add_to_inventory`, `remove_amount`, and `move_amount`/`top_up_matching_stacks` (native `MoveItemAmtToDiffInv`). Invalidates inventory caches after changes. |
+| `hooks.lua` | The crafting/affordability hooks + their registration, the material-UI gating for `GetAmtOfItem`, and the per-craft player snapshot (`pre_craft_counts`). |
+| `deposit.lua` | Quick-deposit logic + `RegisterKeyBind`. |
 
-1. **Post-hook on `ContainsItemsAmt`** — if the native result is `false`, recomputes using player inventory + every chest found via `FindAllOf("BC_InventorySystem_C")` filtered by the chest-outer check; if the combined total covers every required item, overrides `Contains` to `true`. This is meant to fix both the tile's craftable-looking state and unblock the Craft button itself (since native click-handling likely gates on the tile's `IsCraftable`/button-enabled state, which derives from this same check).
-2. **Pre-hook on `CraftItemSlot`** — reads `CraftingRecipy.CraftingParts_5_...` (tries a few candidate field name strings for robustness), and for each ingredient computes `deficit = qty_needed - get_amt_of_item(player_inventory, item_class)`. If `deficit > 0`, pulls that amount from chest slots into the player's inventory via `MoveItemAmtToDiffInv`, using `GetFirstNotFullSlotForItem`/`GetFirstIndexWithFreeSlot` to pick a target slot index. The native `CraftItemSlot` logic then proceeds immediately afterward and consumes/saves — so nothing is left over in the player's bag beyond what gets spent in the very same craft action.
+### Performance notes (Craft latency)
 
-### Known pitfall already hit and fixed
+- `try_get` remembers which candidate field name resolved (keyed by the fields table) and reads it directly, skipping failed `pcall`s per slot.
+- Inventory scan reads quantity first and skips empty slots without probing item fields / `GetFullName`.
+- Decisions use `has_enough_with_chests`, which checks the player's bag first (no chest scan if it already covers the need) and stops as soon as enough is found.
+- `config.scan_radius` (0 = whole map) skips out-of-range chests entirely.
+- At craft time the removal hook drops **all** content caches to force a fresh recount before deciding — deliberate: it only fires on a real click, keeps multiplayer decisions correct, and means chest stock is only ever decremented after a fresh "have enough" confirmation (check-before, never roll-back, so nothing is ever put back into a chest).
 
-At game launch, `BC_InventorySystem_C` is not yet loaded as a class, so `RegisterHook` on its functions fails immediately with "no UFunction with the specified name was found". Fix (same pattern as the older quick-stack mod): defer hook registration until `/Script/Engine.PlayerController:ClientRestart` fires (and also retry on any new `UserWidget` until both hooks are registered), guarded by `contains_hook_registered`/`craft_hook_registered` booleans so registration only actually happens once successfully. This part now works — logs confirm both hooks register successfully after the fix.
+## Key native functions (via UE4SS EventViewer trace of clicking "Craft")
 
-### Currently being debugged
+On `BC_InventorySystem_C`, full path prefix `/Game/Code/Inventory_Items/Framework_and_Data/BC_InventorySystem.BC_InventorySystem_C:`
 
-Hooks register fine (confirmed in logs), but in-game testing shows:
+- **`CraftItemSlot(CraftingRecipy, CraftingPlayerController)`** — master craft fn. Internally: `ContainsItemsAmt` (afford check) → `RemoveMultipleItems` (consumption) → `AddItemForPlayer` (output) → replication/UI refresh → `SaveInventory`. AutoChest hooks `RemoveMultipleItems` (not `CraftItemSlot`) for the chest pull.
+- **`ContainsItemsAmt(Items: Array<S_InventorySlotSlim>) -> Contains: Bool`** — drives BOTH the craft-time afford gate AND the tile's craftable/button-enabled display.
+- **`ContainsItemAmt(Item, GivenItem) -> Contains: Bool`** — per-item version.
+- **`GetAmtOfItem`** — the per-item count the material displays read; hooked to inflate with chest totals, gated to material-UI windows.
+- **`RemoveMultipleItems`** — native consumption; only consumes the player's regular inventory (not hotbar/equipped, not chests), so the post-hook removes the remainder from hotbar + chests.
+- **`MoveItemAmtToDiffInv(source, target, sourceIndex0, targetIndex0, amount)`** — moves between inventories with correct save/replication; used by quick-deposit (and by EnhancedChests).
+- Struct fields confirmed (the `_N_HEX` suffixes are why `config.*_FIELDS` try several candidates): `S_InventorySlotSlim` → `Item_4_...` (item class), `Quantity_5_...` (int). Inventory slot array is the `Inventory` property.
+- Chest detection: an inventory's `GetOuter()` full name contains `"Chest"`; the player's contains `"MainPlayerCharacter"`.
+- Hook timing: for `/Game/...` (Blueprint) UFunctions, `RegisterHook`'s callback runs AFTER the native fn and its return value overrides the native return.
 
-- The Craft button still can't be clicked when ingredients are only in a chest (not in player inventory).
-- No combined player+chest resource count appears to be reflected anywhere.
+### Hook-registration timing pitfall (handled)
 
-Debug `log("DEBUG: ...")` lines have just been added throughout `on_contains_items_amt_post`, `get_all_chest_inventories`, and `call_inventory_function` to surface: whether the post-hook fires at all when the UI recalculates craftability, what `Contains` value the native function originally computed, per-item needed/total-with-chests amounts, how many chest inventories are actually found vs. skipped (and why), and whether `GetAmtOfItem`/`GetFirstNotFullSlotForItem`/`GetFirstIndexWithFreeSlot` are found as valid callable functions on the inventory instance at all.
+At launch, `BC_InventorySystem_C` isn't loaded yet, so `RegisterHook` fails. `hooks.register_hooks()` is deferred to `/Script/Engine.PlayerController:ClientRestart` and retried on every new `UserWidget` until `hooks.all_registered()` is true (guarded by per-hook flags so each only registers once).
 
-**Next step when resuming:** get a fresh in-game log capture (open workbench with ingredients only in a nearby chest) and read the new `[AutoChest] DEBUG: ...` lines to find which assumption is wrong — likely candidates: `ContainsItemsAmt` post-hook never firing for the UI's craftability check (vs. only firing at actual craft time), `is_chest_inventory` not matching the real chest outer name, or `GetAmtOfItem`/slot field names not matching what's actually on this struct version.
+## Configuration
+
+`config.txt` in the mod root (read once at load by `config.load_file`; lines `key=value`, `#` comments):
+- `scan_radius` (default `0`) — crafting chest-search radius in Unreal units (100 = 1 m); `0` = whole map.
+- `deposit_radius` (default `2200`) — quick-deposit nearby range (not a whole-map value).
+- `deposit_key` (default `F2`) — UE4SS `Key` enum name for quick-deposit.
+
+`DEBUG_ENABLED` at the top of `config.lua` toggles verbose per-item traces (leave `false`; printing lags the Craft button).
+
+## Multiplayer notes
+
+- Each client must install the mod. Behaviour confirmed across host (listen-server, authoritative) and client (server-authoritative) sessions.
+- The craft decision is recomputed fresh at click time, so another player emptying a chest in the stale-cache window can't allow a phantom craft. A microscopic race remains between the fresh recount and the decrement, but `decrement_from_inventory` always re-reads live slot quantities, so the worst case is "slightly less removed", never a chest-rollback or item loss.
+- Direct chest slot writes (decrement/add) are authoritative on a listen-server; on a pure client the server may override them — an area to watch if desync is ever reported.
 
 ## Deferred work
 
-- Hammer/build mode (construction ingredient pulling) — `SW_CurBuildableInfo_C` and its placement function have not been reverse-engineered yet. Explicitly deferred by the user until crafting/cooking works end-to-end.
+- Hammer/build-mode ingredient *pulling* (counts already work). `SW_CurBuildableInfo_C` placement fn not reverse-engineered. Deferred by the user until crafting/cooking is solid.
 
-## How to install/sync
+## Install/sync
 
-After editing either copy, copy the file to the other location to keep them identical:
-
-- Installed: `D:\SteamLibrary\steamapps\common\Solarpunk\Solarpunk\Binaries\Win64\ue4ss\Mods\AutoChest\Scripts\main.lua`
-
-UE4SS in this install auto-detects mods by the presence of `enabled.txt` in the mod's folder — no `mods.txt` entry is required for custom mods (confirmed: other custom mods like `EnhancedChests` aren't listed in `mods.txt` either).
+Single live copy: `…/ue4ss/Mods/AutoChest/`. UE4SS auto-detects the mod via the `enabled.txt` file in its folder (no `mods.txt` entry needed). After editing, no build step — restart the game (or reload UE4SS Lua mods) to apply.
